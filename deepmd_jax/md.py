@@ -1,0 +1,1316 @@
+from typing import List, Optional
+import sys
+import jax_md
+import jax
+import jax.numpy as jnp
+import numpy as np
+import flax.linen as nn
+import gc
+from time import time
+from ase import io, Atoms
+from jax.sharding import PartitionSpec as PSpec
+from .data import compute_lattice_candidate
+from .utils import split, concat, load_model, norm_ortho_box, get_p3mlr_fn, get_p3mlr_grid_size, get_schrodinger_1e_fn, VH_bias_fn_for_e_H_reaction
+from typing import Callable
+from functools import partial
+
+MASS_UNIT_CONVERSION = 1.036427e2 # from Dalton to eV * fs^2 / Å^2
+TEMP_UNIT_CONVERSION = 8.617333e-5 # from Kelvin to eV
+PRESS_UNIT_CONVERSION = 6.241509e-7 # from bar to eV / Å^3
+
+def reorder_by_device(coord, type_count):
+    '''
+        For multiple devices, ghost atoms are padded to ensure equal partitioning.
+        Each type of atom is padded and partitioned separately and then concatenated.
+    '''
+    K = jax.device_count()
+    coord = jnp.concatenate(
+                [
+                    jnp.pad(c,
+                            ((0,-c.shape[0]%K),)+((0,0),)*(c.ndim-1)
+                        ).reshape(K,-1,*c.shape[1:])
+                    for c in split(coord,type_count)
+                ], axis=1).reshape(-1, *coord.shape[1:])
+    # sharding = jax.sharding.PositionalSharding(jax.devices())
+    # return jax.lax.with_sharding_constraint(coord, sharding.replicate())
+    return jax.lax.with_sharding_constraint(coord, PSpec())
+
+def get_mask_by_device(type_count):
+    '''
+        For multiple-device partitioning, ghost atoms are padded.
+        Returns a binary mask indicating the valid atoms, sharded by device.
+    '''
+    K = jax.device_count()
+    mask = concat([
+                concat([jnp.ones(count, dtype=bool),
+                        jnp.zeros((-count%K,), dtype=bool)
+                        ]).reshape(K,-1)
+                for count in type_count
+                ],
+            axis=1).reshape(-1)
+    # ensure mask is sharded by device
+    # sharding = jax.sharding.PositionalSharding(jax.devices())
+    # return jax.lax.with_sharding_constraint(mask, sharding)
+    return jax.lax.with_sharding_constraint(mask, PSpec('atom'))
+
+def get_type_mask_fns(type_count):
+    '''
+        Returned type_mask_fns filter nbrs.idx by atom type.
+        Padded ghost atoms are excluded.
+        This can be used to postprocess neighbor indices,
+        and can also be added as a custom_mask_function in jax_md.neighbor_list.
+    '''
+    type_mask_fns = []
+    K = jax.device_count()
+    full_mask = get_mask_by_device(type_count)
+    type_count_each = -(-np.array(type_count)//K)        # type_count for each device after padding
+    type_idx_each = np.cumsum([0] + list(type_count_each)) # type_idx for each device after padding
+    N_each = type_idx_each[-1] # number of atoms for each device after padding
+    for i in range(len(type_count)):
+        # filter neighbor atoms by type i; idx = nbrs.idx returned by jax_md
+        def mask_fn(idx, i=i): 
+            # ensure idx is sharded by device
+            # sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K,1)
+            # idx = jax.lax.with_sharding_constraint(idx, sharding)
+            idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
+            valid_center_atom = full_mask[:,None]
+            valid_type_neighbor_atom = idx%N_each >= type_idx_each[i]
+            valid_type_neighbor_atom *= idx%N_each < type_idx_each[i+1]
+            valid_neighbor_atom = (idx-type_idx_each[i]-(idx//N_each)*(N_each-type_count_each[i]) < type_count[i])
+            is_neighbor = (idx < N_each * K)
+            filter = valid_center_atom * valid_type_neighbor_atom * valid_neighbor_atom * is_neighbor
+            return jnp.where(filter, idx, N_each * K)
+        type_mask_fns.append(mask_fn)
+    return type_mask_fns
+
+def get_idx_mask_fn(type_count):
+    '''
+        Returned idx_mask_fn that filters out ghost atoms from nbrs.idx.
+    '''
+    full_mask = get_mask_by_device(type_count)
+    idx_mask_out = np.arange(len(full_mask))[~np.array(full_mask)]
+    def idx_mask_fn(idx):
+        # ensure idx is sharded by device
+        # sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(jax.device_count(),1)
+        # idx = jax.lax.with_sharding_constraint(idx, sharding)
+        idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
+        filter = full_mask[:,None] * jnp.isin(idx, idx_mask_out, invert=True)
+        return jnp.where(filter, idx, len(full_mask))
+    return idx_mask_fn
+
+@jax_md.dataclasses.dataclass
+class TypedNeighborList():
+    '''
+        Wraps jax_md.partition.NeighborList with typed lists.
+    '''
+    nbrs: jax_md.partition.NeighborList
+    knbr: list[int] = jax_md.dataclasses.static_field()
+    nbrs_nm: list[list[jnp.ndarray]]
+    reference_box: jax.Array
+    did_buffer_overflow: bool = False
+    @property
+    def idx(self) -> jax.Array:
+        return self.nbrs.idx
+    @property
+    def reference_position(self) -> jax.Array:
+        return self.nbrs.reference_position
+
+@jax_md.dataclasses.dataclass
+class typed_neighbor_list_fn():
+    '''A struct containing functions to allocate and update neighbor lists.'''
+    allocate: Callable = jax_md.dataclasses.static_field()
+    update: Callable = jax_md.dataclasses.static_field()
+
+def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
+    '''
+        Returns a typed neighbor list function that can be used to allocate and update neighbor lists.
+        allocate_fn() and update_fn() accept real space coordinates but processes internally in fractional coordinates.
+    '''
+    type_idx = np.array(type_idx, dtype=int)
+    type_count = tuple(type_count)
+    reference_box = box.astype(jnp.float32) # box at creation of typed_neighbor_list_fn; pass only this box to jax_md.neighbor_list
+    type_mask_fns = get_type_mask_fns(type_count)
+    idx_mask_fn = get_idx_mask_fn(type_count)
+    
+    def canonicalize(coord, box=reference_box):
+        # scale coord to reference_box and store in float32 fractional coordinates
+        box = box.astype(jnp.float32)
+        scale = reference_box[0] / box[0]
+        coord = coord[type_idx.argsort(kind='stable')]
+        coord = (coord.astype(jnp.float32) % box) * scale
+        # shrink by 1e-7 from the boundary to avoid numerical issues
+        coord = coord * (1-5e-7)
+        # reorder and partition to multiple devices
+        coord = reorder_by_device(coord, type_count)
+        return coord
+    
+    # allocate function: non-jit-compatible
+    def allocate_fn(coord, box=reference_box):
+        coord = canonicalize(coord, box)
+        displacement_fn = jax_md.space.periodic(reference_box)[0]
+        # Measure the exact size of max neighbors for each atom type
+        test_nbr = jax_md.partition.neighbor_list(displacement_fn,
+                                                  reference_box,
+                                                  rcut * reference_box[0] / box[0], # scale rcut to reference_box
+                                                  capacity_multiplier=1.,
+                                                  custom_mask_function=idx_mask_fn
+                                                ).allocate(coord)
+        knbr = np.array([
+                (type_mask(test_nbr.idx) < len(coord)).sum(1).max()
+                for type_mask in type_mask_fns
+            ])
+        # Bloat knbr by buffer_ratio; also ensure if buffer_ratio += 0.05, knbr at least +1
+        knbr = np.where(knbr == 0,
+                        1,
+                        1 + (knbr * buffer_ratio + 
+                            np.maximum(20 - knbr,0) * max(buffer_ratio-1.2,0)))
+        knbr = list(knbr.astype(int))
+        print(f'# Neighborlist allocated with size {np.array(knbr) - 1}, rcut_plus_skin = {rcut}, buffer_ratio = {buffer_ratio}')
+        # infer a total buffer from the max neighbors of each type
+        total_buffer_ratio = (sum(knbr)+1.01) / test_nbr.idx.shape[1]
+        # Allocate the neighbor list with the inferred buffer ratio
+        nbrs = jax_md.partition.neighbor_list(displacement_fn,
+                                              box,
+                                              rcut * reference_box[0] / box[0], # scale rcut to reference_box
+                                              capacity_multiplier=total_buffer_ratio * 1.1,
+                                              custom_mask_function=idx_mask_fn
+                                            ).allocate(coord)
+        nbrs_nm, overflow = get_nm(nbrs, knbr)
+        return TypedNeighborList(nbrs=nbrs,
+                                 knbr=knbr,
+                                 nbrs_nm=nbrs_nm,
+                                 did_buffer_overflow=overflow,
+                                 reference_box=reference_box)
+    
+    # update function: jit-compatible
+    def update_fn(coord, typed_nbrs, box=reference_box):
+        coord = canonicalize(coord, box)
+        typed_nbrs = typed_nbrs.set(nbrs=typed_nbrs.nbrs.update(coord))
+        nbrs_nm, overflow = get_nm(typed_nbrs.nbrs, typed_nbrs.knbr)
+        return typed_nbrs.set(nbrs_nm=nbrs_nm,
+                              did_buffer_overflow=overflow|typed_nbrs.did_buffer_overflow)
+    
+    def get_nm(nbrs, knbr):
+        '''
+            Get neighbor idx as a nested list of device-sharded arrays.
+            nbrs_nm[i][j] for type i center atoms with neighbor type j.
+            Entries stand for atom indices after device partitioning.
+        '''
+
+        # ensure idx is sharded by device
+        K = jax.device_count()
+        # sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(K, 1)
+        # nbr_idx = jax.lax.with_sharding_constraint(nbrs.idx, sharding)
+        nbr_idx = jax.lax.with_sharding_constraint(nbrs.idx, PSpec('atom'))
+        # take knbr[i] smallest indices for type i
+        nbrs_idx = [-jax.lax.top_k(-fn(nbr_idx), k)[0]
+                    for fn,k in zip(type_mask_fns, knbr)]
+        type_count_each = -(-np.array(type_count)//K)        # type_count for each device after padding
+        type_idx_each = np.cumsum([0] + list(type_count_each)) # type_idx for each device after padding
+        # convert idx to each type pair; this is a bit tricky
+        nbrs_nm = [mlist for mlist in 
+                   zip(*[split(jnp.where(nbrs < type_idx_each[-1]*K,
+                                         nbrs - type_idx_each[i] - (nbrs//type_idx_each[-1]) * (type_idx_each[-1] - type_count_each[i]),
+                                         type_idx_each[-1]*K
+                                    ), type_count_each, K=K)
+                        for i, nbrs in enumerate(nbrs_idx)
+                        ])]
+        overflow = nbrs.did_buffer_overflow | jnp.array([
+                                    (idx.max(axis=1)<type_idx_each[-1]*K).any()
+                                    for idx in nbrs_idx
+                                    ]).any()
+        nbrs_nm = [[n[:,:-1] for n in nbrs_m] for nbrs_m in nbrs_nm]
+        return nbrs_nm, overflow
+    
+    return typed_neighbor_list_fn(allocate=allocate_fn, update=update_fn)
+
+class Simulation:
+    '''
+        A deepmd-based simulation class that wraps jax_md.simulate routines.
+        Two-step usage: instantiate and run(steps).
+    '''
+
+    step: int = 0
+    _step_chunk_size: int = 200
+    _dr_buffer_lattice: float = 1.
+    _neighbor_update_profile: jax.Array = jnp.array([0.])
+    _error_code: int = 0
+    _is_initial_state: bool = True
+
+    def __init__(self,
+                 model_path,
+                 box,
+                 type_idx,
+                 mass,
+                 routine,
+                 dt,
+                 initial_position,
+                 freeze_idx=None,
+                 initial_velocity=None,
+                 report_interval=200,
+                 temperature=None,
+                 pressure=None,
+                 debug=False,
+                 grid_size=None,
+                 bias=False,
+                 seed=0,
+                 model_deviation_paths=[],
+                 use_neighbor_list_when_possible=True,
+                 neighbor_skin: float = None,
+                 neighbor_buffer_ratio: float = 1.2,
+                 tau_t=100.,
+                 tau_p=1000.,
+                 chain_length_t=3,
+                 chain_length_p=3,
+                 chain_steps_t=1,
+                 chain_steps_p=1,
+                 sy_steps_t=1,
+                 sy_steps_p=1,
+                ):
+        '''
+            Initialize a Simulation instance.
+            model_path: path to the deepmd model
+            box: box size, scalar or (3,) or (3,3)
+            type_idx: list of atom types, length = n_atoms
+            mass: atomic mass for each type, length = number of atom types
+            routine: simulation routine, currently limited to 'NVE', 'NVT', 'NPT', where NVT/NPT uses Nose-Hoover thermostat/barostat
+            dt: time step size (fs)
+            initial_position: shape = (n_atoms, 3)
+            initial_velocity: shape = (n_atoms, 3); if None, use temperature to generate; if temperature is also None, use 0.
+            report_interval: print log every report_interval steps
+            temperature: temperature in NVT/NPT simulations, or NVE initial_velocity generation if initial_velocity is None.
+            pressure: pressure in NPT simulations
+            debug: print additional debug information
+            seed: random seed for jax random number generator, e.g. in velocity initialization
+            model_deviation_paths: a list of deepmd models for deviation calculation used in active learning
+            use_neighbor_list_when_possible: if False, neighbor list will be disabled (for debug use)
+            neighbor_skin: buffer radius for neighbor list
+            neighbor_buffer_ratio: capacity of neighbor list = neighbor_buffer_ratio * max_neighbors
+            tau: Nose-Hoover thermostat/barostat relaxation time (fs)
+            chain_length: Nose-Hoover thermostat/barostat chain length
+            chain_steps: Nose-Hoover thermostat/barostat chain steps
+            sy_steps: Nose-Hoover thermostat/barostat number of Suzuki-Yoshida steps (must be 1,3,5,7)
+            ############################
+            Usage:
+                sim = Simulation(...)
+                trajectory = sim.run(steps)
+        '''
+        initial_position = jnp.array(initial_position) * jnp.ones(1) # Ensure default precision
+        self.report_interval = int(report_interval)
+        self.log = []
+        self._natoms = initial_position.shape[0]
+        self._dt = dt
+        self._routine = routine
+        self._temperature = temperature
+        self._type_idx = np.array(type_idx.astype(int))
+        self._mass = jnp.array(np.array(mass)[np.array(self._type_idx)]) # AMU
+        self._bias = bias
+        if freeze_idx is not None:
+            self._mass = self._mass.at[np.array(freeze_idx)].set(1e10)
+        self._model, self._variables = load_model(model_path)
+        if 'dplr' in self._model.params['type']:
+            self._w_model, self._w_variables = self._model.params['dplr_wannier_model_and_variables']
+        type_count = np.bincount(self._type_idx)
+        self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
+        self._debug = debug
+        self._step_chunk_size = max(10, min(100, 100000 // self._natoms))
+        self._model_deviation_paths = model_deviation_paths
+        self._use_model_deviation = len(model_deviation_paths) > 0
+        self._grid_size = grid_size
+        self._current_psi = None
+        if neighbor_skin is None:
+            self._neighbor_skin = 0.5 if "NPT" in self._routine else 0.3
+        else:
+            self._neighbor_skin = neighbor_skin
+        self._neighbor_buffer_ratio = neighbor_buffer_ratio
+        # If orthorhombic, keep box as (3,); else keep (3,3)
+        box = jnp.array(box)
+        if box.size == 1:
+            self._initial_box = box.item() * jnp.ones(3)
+        elif box.shape == (3,3) and (box == jnp.diag(jnp.diag(box))).all():
+            self._initial_box = jnp.diag(box)
+        else:
+            self._initial_box = box
+        self._current_box = self._initial_box
+        self._static_args = self._get_static_args(initial_position, use_neighbor_list_when_possible)
+        self._displacement_fn, self._shift_fn = jax_md.space.periodic_general(self._initial_box,
+                                                                              fractional_coordinates="NPT" in self._routine)
+
+        # Initialize according to routine;
+        if self._routine == "NVE":
+            self._routine_fn = jax_md.simulate.nve
+            self._routine_args = {}
+        elif self._routine == "NVT":
+            self._routine_fn = jax_md.simulate.nvt_nose_hoover
+            self._routine_args = {
+                'kT': self._temperature * TEMP_UNIT_CONVERSION,
+                'tau': tau_t,
+                'chain_length': chain_length_t,
+                'chain_steps': chain_steps_t,
+                'sy_steps': sy_steps_t,
+            }
+        elif self._routine == "NPT":
+            box33 = jnp.diag(self._initial_box) if self._initial_box.shape == (3,) else self._initial_box
+            initial_position = initial_position @ jnp.linalg.inv(box33)
+            self._routine_fn = jax_md.simulate.npt_nose_hoover
+            if pressure is None:
+                raise ValueError("Missing argument 'pressure' (in bar) for routine 'NPT'")
+            self._routine_args = {
+                'pressure': pressure * PRESS_UNIT_CONVERSION,
+                'kT': self._temperature * TEMP_UNIT_CONVERSION,
+                'barostat_kwargs': {'tau': tau_p,
+                                    'chain_length': chain_length_p,
+                                    'chain_steps': chain_steps_p,
+                                    'sy_steps': sy_steps_p},
+                'thermostat_kwargs': {'tau': tau_t,
+                                      'chain_length': chain_length_t,
+                                      'chain_steps': chain_steps_t,
+                                      'sy_steps': sy_steps_t},
+            }
+            self._pressure = pressure
+        else:
+            raise NotImplementedError("routine currently limited to 'NVE', 'NVT', 'NPT'")
+        print(f"# Initialized {self._routine} simulation with {self._natoms} atoms")
+
+        # Initialize neighbor list if needed
+        if self._static_args['use_neighbor_list']:
+            self._construct_nbr_and_nbr_fn(initial_position)
+        self._gen_fn()
+        self._state = self._init_fn(
+                                jax.random.PRNGKey(seed),
+                                initial_position,
+                                mass=self._mass * MASS_UNIT_CONVERSION,
+                                kT=((self._temperature if self._temperature is not None else 0)
+                                      * TEMP_UNIT_CONVERSION),
+                                nbrs_nm=self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None,
+                                box=self._initial_box,
+                                init_psi=self._current_psi
+                            )
+
+        if initial_velocity is not None:
+            self.setVelocity(initial_velocity)
+
+    def _gen_fn(self):
+        ''' 
+            Generate the energy function and relevant functions.
+            Need to regenerate when static_args changes.
+            Beware of the order of functions here, as some functions depend on previous generated functions.
+            Neighbor list functions are generated in _construct_nbr_and_nbr_fn separately.
+        '''
+        self._energy_fn = self._get_energy_fn()
+        self._force_fn = lambda coord, **kwargs: -jax.grad(self._energy_fn)(coord, **kwargs)
+        def pressure_fn(state, box, nbrs_nm, **kwargs):
+            KE = jax_md.quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
+            return jax_md.quantity.pressure(
+                        self._energy_fn,
+                        state.position,
+                        box,
+                        KE,
+                        nbrs_nm=nbrs_nm,
+                        **kwargs
+                    ) / PRESS_UNIT_CONVERSION
+        self._pressure_fn = pressure_fn
+        if self._use_model_deviation:
+            self._deviation_energy_fns = [
+                self._get_energy_fn(load_model(path)) for path in self._model_deviation_paths
+            ]
+        self._init_fn, self._apply_fn = self._routine_fn(self._energy_fn,
+                                                     self._shift_fn,
+                                                     self._dt,
+                                                     **self._routine_args)
+        self._report_fn = self._generate_report_fn()
+        self._soft_update_nbrs = self._get_soft_update_nbrs_fn()
+        self._check_hard_overflow = self._get_check_hard_overflow_fn()
+        self._multiple_inner_step_fn = self._get_inner_step()
+
+    def _get_energy_fn(self, model_and_variables=None):
+
+        if model_and_variables is None:
+            model_and_variables = (self._model, self._variables)
+            # model_and_variables_list = [load_model(path)) for path in self._model_deviation_paths]
+            # load_model(path)) for path in self._model_deviation_paths
+        model, variables = model_and_variables
+        if 'dplr' in model.params['type']:
+            if self._current_box.size > 3:
+                raise NotImplementedError("dplr-q1 model currently only supports orthorhombic box")
+            if 'NPT' in self._routine:
+                raise NotImplementedError("needs a bit more editing to work with NPT")
+            # q_coord = np.repeat(np.array([6,1]), self._type_count)
+            # q_wc = np.repeat(np.array([-8]), self._type_count[self._w_model.params['nsel']])
+            q_coord = jnp.array(np.repeat(model.params['dplr_q_atoms'], self._type_count))
+            q_wc = jnp.array(np.repeat(model.params['dplr_q_wc'],
+                                      [self._type_count[i] for i in self._w_model.params['nsel']]))
+            q = np.concatenate([q_coord, q_wc])
+            if self._grid_size is not None:
+                M = [self._grid_size] * 3 if type(self._grid_size) is int else list(self._grid_size)
+            else:
+                M = get_p3mlr_grid_size(np.array(self._current_box), beta = 1, resolution = self._model.params['dplr_resolution'])
+            if self._current_psi is None and 'dplr_q1' in model.params['type']:
+                self._current_psi = jax.random.normal(jax.random.PRNGKey(0), M, jnp.float64 if jax.config.read('jax_enable_x64') else jnp.float32)
+                self._current_psi /= jnp.linalg.norm(self._current_psi)
+            p3mlr_fn = get_p3mlr_fn(self._current_box, model.params['dplr_beta'], M=M)
+            solve_E_electron, get_V_grid, ground_state, berry_center, get_VH = get_schrodinger_1e_fn(
+                box3=self._current_box,
+                beta0=model.params['dplr_q1_beta'],
+                w_model=self._w_model,
+                w_variables=self._w_variables,
+                dplr_q_atoms=model.params['dplr_q_atoms'],
+                dplr_q_wc=model.params['dplr_q_wc'],
+                static_args=self._static_args,
+                M=M,
+            )            
+        # k = 2*jnp.pi*jnp.fft.fftfreq(M[0], d=self._current_box[0]/M[0])
+        # kgrid = jnp.stack(jnp.meshgrid(k, k, k, indexing='ij'), axis=0)
+        # k2 = jnp.sum(kgrid**2, axis=0)
+        # k2factor = 4 * jnp.pi / self._current_box[0]**3 * jnp.where(k2 == 0, 0, 1/k2) #* jnp.exp(-k2/(4*beta**2))
+        # def get_V(coords, wc):
+        #     # return jnp.zeros(M) # --- IGNORE ---
+        #     V_k = (jnp.exp(-1j * (jnp.concatenate([coords, wc]) @ kgrid.reshape(3, -1))) * q[:, None]).sum(0)
+        #     V_k = V_k.reshape(M[0], M[1], M[2]) * k2factor * jnp.exp(-k2/(4*self._beta0**2))
+        #     # V_k_O = (jnp.exp(-1j * (coords[:64] @ kgrid.reshape(3, -1))) * (8 * jnp.ones((64, 1)))).sum(0)
+        #     # V_k_H = (jnp.exp(-1j * (coords[64:] @ kgrid.reshape(3, -1))) * jnp.ones((129, 1))).sum(0)
+        #     # V_k_wc = (jnp.exp(-1j * (wc @ kgrid.reshape(3, -1))) * (-8 * jnp.ones((64, 1)))).sum(0)
+        #     # V_k_O_reshape = V_k_O.reshape(M[0], M[1], M[2])
+        #     # V_k_O = V_k_O_reshape * k2factor * jnp.exp(-k2/(4*self._beta_O**2))
+        #     # V_k_wc = V_k_wc.reshape(M[0], M[1], M[2]) * k2factor * jnp.exp(-k2/(4*self._beta_O**2))
+        #     # V_k_H = V_k_H.reshape(M[0], M[1], M[2]) * k2factor * jnp.exp(-k2/(4*self._beta_H**2))
+        #     # V_k_HO = -2/8 * V_k_O_reshape * k2factor * jnp.exp(-k2/(4*self._beta_H**2))
+        #     # V_k = V_k_O + V_k_H + V_k_wc + V_k_HO
+        #     V_k_sym = V_k.copy()
+        #     for axis in (0,1,2):
+        #         V_k_sym = jnp.roll(jnp.flip(V_k_sym, axis=axis), 1, axis=axis)
+        #     V_k = -14.399645 * 0.5 * (V_k + V_k_sym.conj())
+        #     V = jnp.fft.ifftn(V_k).real * M[0]**3
+        #     return V
+            # real_grid = (self._current_box/np.array(M))[:,None,None,None] * jnp.stack(jnp.meshgrid(*[jnp.arange(m) for m in M], indexing='ij'), axis=0)
+            # cube_idx = (jnp.stack(jnp.meshgrid(*([jnp.array([-1,0,1])]*3),indexing='ij'))).reshape(3,27)
+            # kgrid = jnp.stack(jnp.meshgrid(*[jnp.arange(m) for m in M], indexing='ij'))
+            # MM = jnp.array(M).reshape(3,1,1,1)
+            # kgrid = 2*jnp.pi/self._current_box[:,None,None,None] * ((kgrid-MM/2)%MM-MM/2)
+            # ksquare = (kgrid ** 2).sum(0)
+            # z = kgrid * (self._current_box/jnp.array(M))[:,None,None,None] / 2
+            # sinz = jnp.sin(z)
+            # w3k = jnp.prod(jnp.where(z==0, 1, (sinz/z)**3), axis=0)
+            # Sk = jnp.prod(1 - sinz**2 + 2/15*sinz**4, axis=0)
+            # kfactor = -(14.399645*4*jnp.pi*jnp.prod(jnp.array(M))/jnp.prod(self._current_box)) * jnp.exp(-ksquare/(4*model.params['dplr_q1_beta']**2)) * w3k/(Sk*ksquare)
+            # kfactor = kfactor.at[0,0,0].set(0.)
+            # p3mlr_fn = get_p3mlr_fn(self._current_box, model.params['dplr_beta'], M=M)
+        # def get_V(coords, wc):
+        #     coord_N3 = jnp.concatenate([coords, wc])
+        #     grid = jnp.zeros(M)
+        #     M3 = jnp.array(M)
+        #     coord_3N = ((coord_N3 % self._current_box) / self._current_box * M3).T
+        #     center_idx_3N = jnp.rint(coord_3N).astype(int) # in [0, M3]
+        #     r_3N = coord_3N - center_idx_3N # lies in (-0.5, 0.5)
+        #     fr_33N = jnp.stack([(r_3N-0.5)**2/2,
+        #                         0.75 - r_3N**2,
+        #                         (r_3N+0.5)**2/2]) # TSC assignment
+        #     fr_27N = (fr_33N[:,None,None,0,:]*fr_33N[:,None,1,:]*fr_33N[:,2,:]).reshape(27,-1)
+        #     all_idx = (center_idx_3N[:,None] + cube_idx[:,:,None]).reshape(3,-1) % M3[:,None]
+        #     grid = grid.at[tuple(all_idx)].add((q*fr_27N).reshape(-1))
+        #     grid = jnp.fft.ifftn(jnp.fft.fftn(grid) * kfactor).real
+        #     return grid
+        # def ground_state(V, psi, tol=1e-4, max_step=100):
+        #     n3, h3 = V.shape, self._current_box / np.array(V.shape)
+        #     dk  = [2*jnp.pi * jnp.fft.fftfreq(n, d=h) for n, h in zip(n3, h3)]
+        #     T_k = 3.809982 * (dk[0][:,None,None]**2 + dk[1][None,:,None]**2 + dk[2][None,None,:]**2)
+        #     mu = jnp.clip(0.5 * jnp.std(V), 1e-4 * T_k.max(), 0.05 * T_k.max())
+        #     psi_k = jnp.fft.fftn(psi)
+        #     E = ((psi.conj() * psi).real * V).sum() + ((psi_k * psi_k.conj()).real * T_k).sum() / psi.size
+        #     def step(state):
+        #         for i in range(4):
+        #             psi, psi_k, E, _, k = state
+        #             psi_k_conj = psi_k.conj()
+            #         res_k = jnp.fft.fftn(V * psi) + (T_k - E) * psi_k
+            #         res_norm = jnp.sqrt((jnp.abs(res_k)**2).sum() / psi.size)
+            #         z_k = res_k / (T_k + mu) # preconditioner
+            #         z_k = z_k - (z_k * psi_k_conj).sum() * psi_k / psi.size
+            #         b_k = z_k / (jnp.sqrt((jnp.abs(z_k)**2).sum() / psi.size))
+            #         b = jnp.fft.ifftn(b_k)
+            #         A12 = (psi.conj() * V * b).sum() + (psi_k_conj * T_k * b_k).sum() / psi.size
+            #         A22 = ((b.conj() * b).real * V).sum().real + ((b_k.conj() * b_k).real * T_k).sum() / psi.size
+            #         c0, c1 = (A22-E) + ((E-A22)**2 + 4*(A12*A12.conj()).real)**0.5, -2*A12.conj()
+            #         psi_new = c0 * psi + (c1 * b).real
+            #         normalizer =  (psi_new.conj() * psi_new).real.sum()**0.5
+            #         psi_new /= normalizer
+            #         psi_k_new = (c0 * psi_k + c1 * b_k) / normalizer
+            #         E_new = ((psi_new.conj() * psi_new).real * V).sum() + ((psi_k_new * psi_k_new.conj()).real * T_k).sum() / psi.size
+            #         # jax.debug.print('E: {E:.7f}, Enew: {E_new:.7f}, branch: {b}, c0: {c0}, k: {k}', E=E, E_new=E_new, b=branch, c0=c0, k=k)
+            #         state = (psi_new, psi_k_new, E_new, res_norm, k + 1)
+            #     return state
+            # def cond(state):
+            #     _, _, _, res_norm, k = state
+            #     # return k < 30
+            #     return (jnp.abs(res_norm) > tol) & (k < max_step)
+            # psi, _, E, _, k = jax.lax.while_loop(cond, step, (psi, psi_k, E, 1e10, 0))
+            # rho = jnp.abs(psi)**2 / h3.prod()
+            # return E, rho, psi, k
+        
+        # def ground_state(V, box, psi, tol=1e-6, c=4, decay=0.5, max_decay=4, max_step=2000):
+        #     n, h = V.shape[0], box / V.shape[0]
+        #     tau0 = c * h**2
+        #     dk  = 2*jnp.pi * jnp.fft.fftfreq(n, d=h)
+        #     T_k = 3.809982 * (dk[:,None,None]**2 + dk[None,:,None]**2 + dk[None,None,:]**2) / self._e_mass
+        #     def step(state):
+        #         for i in range(4):
+        #             psi, E_prev, tau, _, k = state
+        #             psi *= jnp.exp(-0.5 * tau * V)
+        #             psi  = jnp.fft.ifftn(jnp.exp(-tau * T_k) * jnp.fft.fftn(psi))
+        #             psi *= jnp.exp(-0.5 * tau * V)
+        #             psi /= jnp.linalg.norm(psi)
+        #             E_new = (psi.conj() * (jnp.fft.ifftn(T_k * jnp.fft.fftn(psi)) + V * psi)).real.sum()
+        #             # jax.debug.print('E_new: {E_new:.7f}, E_prev: {E_prev:.7f}, tau: {tau:.7f}, k: {k}', E_new=E_new, E_prev=E_prev, tau=tau, k=k)
+        #             dE = jnp.abs(E_new - E_prev)
+        #             tau = jnp.where((dE < tol*10) & (tau/tau0 > decay**(max_decay-0.5)), tau * decay, tau)
+        #             state = (psi, E_new, tau, dE, k + 1)
+        #         return state
+        #     def cond(state):
+        #         _, _, tau, dE, k = state
+        #         return ((jnp.abs(dE) > tol) | (tau/tau0 > decay**(max_decay-0.5))) & (k < max_step)
+        #     psi, E, _, _, k = jax.lax.while_loop(cond, step, (psi, 1e10, tau0, 1e10, 0))
+        #     rho = jnp.abs(psi)**2 / h**3
+        #     # jax.debug.print('Ground state converged: E = {E:.7f}, k = {k}', E=E, k=k)
+        #     return E, rho, psi, k
+        
+        # def solve_E_electron(coords, box, nbrs_nm, init_psi):
+        #     wc = self._w_model.wc_predict(self._w_variables, coords, box, self._static_args, nbrs_nm)
+        #     V = get_V(coords, wc)
+        #     E, rho, _, k = ground_state(V, init_psi)
+        #     # jax.debug.print("Iter k={k}", k=k)
+        #     E0 = (jax.lax.stop_gradient(rho) * V).sum() * (jnp.diag(box) / jnp.array(M)).prod()
+        #     E1 = jax.lax.stop_gradient(E - E0)
+        #     return E0 + E1, wc, rho
+
+        # if model.params['type'] == 'dplr':
+        #     if self._current_box.size > 3:
+        #         raise NotImplementedError("dplr model currently only supports orthorhombic box")
+        #     wc_model, wc_variables = model.params['dplr_wannier_model_and_variables']
+        # p3mlr_fn = get_p3mlr_fn(self._current_box, model.params['dplr_beta'], M=M)
+                            # model.params['dplr_beta'],
+                            # resolution=model.params['dplr_resolution'],
+                        # )
+            # qatoms = jnp.array(np.repeat(model.params['dplr_q_atoms'],
+            #                              self._type_count))
+            # qwc = jnp.array(np.repeat(model.params['dplr_q_wc'],
+            #                           [self._type_count[i] for i in wc_model.params['nsel']]))
+        
+
+        def energy_fn(coord, nbrs_nm, perturbation=1., **kwargs):
+            '''
+                Energy function that can be used in jax_md.simulate routines.
+                You can customize the energy function here, i.e. if you want to add perturbations.
+            '''
+            # if box in kwargs, use it else self._current_box, and convert to (3,3)
+            box = kwargs['box'] if 'box' in kwargs else self._current_box
+            if box.size == 1:
+                box = box * jnp.eye(3)
+            elif box.shape == (3,):
+                box = jnp.diag(box)
+            # NPT is computed in fractional coordinates; but we need real space forces returned by grad(energy_fn)
+            if 'NPT' in self._routine:
+                coord = jax.lax.stop_gradient(coord @ box) + coord - jax.lax.stop_gradient(coord)
+            # Atoms are reordered and grouped by type in neural network inputs
+            coord = coord[self._type_idx.argsort(kind='stable')]
+            # perturbation = 1, required by jax-md pressure calculation
+            coord = coord * perturbation
+            box = box * perturbation
+            # Ensure coord and box is replicated on all devices
+            # sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
+            # coord = jax.lax.with_sharding_constraint(coord, sharding)
+            # box = jax.lax.with_sharding_constraint(box, sharding)
+            coord = jax.lax.with_sharding_constraint(coord, PSpec())
+            box = jax.lax.with_sharding_constraint(box, PSpec())
+
+            # Energy calculation
+            E = model.apply(variables,
+                            coord,
+                            box,
+                            self._static_args,
+                            nbrs_nm)[0]
+            if model.params['type'] == 'dplr_q1':
+                E0, wc, rho = solve_E_electron(coord, box, nbrs_nm, init_psi=kwargs['init_psi'])
+                E += E0
+                E += p3mlr_fn(jnp.concatenate([coord, wc]), q)
+            elif model.params['type'] == 'dplr':
+                wc = self._w_model.wc_predict(self._w_variables, coord, box, self._static_args, nbrs_nm)
+                E += p3mlr_fn(jnp.concatenate([coord, wc]), q)
+            if self._bias:
+                center = berry_center(rho, jnp.diag(box))
+                VH, Hyd = get_VH(coord, wc, center, jnp.diag(box), nbrs_nm)
+                dHC = jnp.linalg.norm((center - Hyd - jnp.diag(box)/2) % jnp.diag(box) - jnp.diag(box)/2, axis=-1)
+                E -= VH_bias_fn_for_e_H_reaction(VH, dHC, len(coord) // 3)
+            return E
+        # def berry_center(rho, box):
+        #     s = (jnp.exp(1j * 2*jnp.pi* (real_grid / box[:,None,None,None])) * rho).sum(axis=(1,2,3)) / rho.sum()
+        #     # sigma = jnp.linalg.norm((box / (2 * jnp.pi)) * jnp.sqrt(-2.0 * jnp.log(jnp.abs(s))))
+        #     center = (jnp.angle(s) * box / (2 * jnp.pi)) % box
+        #     return jax.lax.stop_gradient(center)
+        def update_psi_fn(coords, box, init_psi, nbrs_nm):
+            coords = coords[self._type_idx.argsort(kind='stable')]
+            wc = self._w_model.wc_predict(self._w_variables, coords, jnp.diag(box), self._static_args, nbrs_nm)
+            V = get_V_grid(jnp.concatenate([coords, wc]))
+            _, rho, psi, _ = ground_state(V, init_psi, tol=1e-2)
+            center = berry_center(rho, box)
+            # record relevant CV of interest
+            VH, H = get_VH(coords, wc, center, box, nbrs_nm)
+            dHC = jnp.linalg.norm((center - H - box/2) % box - box/2, axis=-1)
+            return psi, center, VH, dHC
+        # def get_Hyd(coords, box):
+        #     N = coords.shape[0] // 3
+        #     O, H = coords[:N], coords[N:]
+        #     distOH = jnp.linalg.norm((O[:,None] - H[None] + box/2) % box - box/2, axis=-1)
+        #     H2_idx = jnp.argsort(distOH, axis=-1)[:,:2].reshape(2*N)
+        #     H_is_bonded = jnp.isin(jnp.arange(2*N+1), H2_idx)
+        #     return H[jnp.argsort(H_is_bonded)[0]]
+        # def get_VH(coords, wc, center, box, nbrs_nm):
+        #     V = get_V(coords, wc)
+        #     Hyd = get_Hyd(coords, box)
+        #     N = coords.shape[0] // 3
+        #     # Hyd = coords[N + jnp.argmin(jnp.linalg.norm((coords[N:] - center - box/2) % box - box/2, axis=-1))]
+        #     return (jnp.fft.fftn(V) * jnp.exp(1j * (Hyd[:,None,None,None] * kgrid).sum(0))).sum().real / V.size, Hyd
+        #     # return (jnp.fft.fftn(V) * jnp.exp(1j * (Hyd[:,None,None,None] * kgrid).sum(0))).sum().real / V.size, get_Hyd(coords, box)
+        self._update_psi_fn = jax.jit(update_psi_fn)
+        return energy_fn
+
+    def _check_if_use_neighbor_list(self):
+        '''
+            Neighbor list currently only allowed for a sufficiently big orthorhombic box.
+        '''
+        if self._current_box.shape == (3,3):
+            return False
+        else:
+            return self._current_box.min() > 2 * (self._model.params['rcut'] + self._neighbor_skin) * (1.02 if "NPT" in self._routine else 1.)
+
+    def _get_static_args(self, position, use_neighbor_list=True):
+        '''
+            Returns a FrozenDict of the complete set of static arguments for jit compilation.
+        '''
+        use_neighbor_list *= self._check_if_use_neighbor_list()
+        if use_neighbor_list:
+            static_args = nn.FrozenDict({'type_count':self._type_count, 'use_neighbor_list':True})
+            return static_args
+        else:
+            # For npt, include extra buffer for lattice selection !! not implemented yet
+            box = jnp.diag(self._current_box) if self._current_box.shape == (3,) else self._current_box
+            lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'])
+            static_args = nn.FrozenDict({'type_count':self._type_count, 'lattice':lattice_args, 'use_neighbor_list':False})
+            return static_args
+
+    def _generate_report_fn(self):
+        '''
+            Returns a set of functions that reports the current state.
+            You can customize report functions with the same signature.
+        '''
+        self._reporters = {
+            "Temperature": lambda state, _, __: jax_md.quantity.temperature(
+                                                            velocity=state.velocity,
+                                                            mass=state.mass,
+                                                        ) / TEMP_UNIT_CONVERSION,
+            "KE": lambda state, _, __: jax_md.quantity.kinetic_energy(
+                                                    velocity=state.velocity,
+                                                    mass=state.mass,
+                                                ),
+            "PE": lambda state, nbrs_nm, init_psi: self._energy_fn(
+                                    state.position,
+                                    box=state.box if "NPT" in self._routine else self._initial_box,
+                                    nbrs_nm=nbrs_nm,
+                                    init_psi=init_psi,
+                                ),                 
+            }
+
+        if self._routine == "NVE":
+            self._reporters["Invariant"] = lambda state, nbrs_nm, init_psi: \
+                                            self._reporters["KE"](state, nbrs_nm, init_psi) + \
+                                            self._reporters["PE"](state, nbrs_nm, init_psi)
+        elif self._routine == "NVT":
+            self._reporters["Invariant"] = lambda state, nbrs_nm, init_psi: jax_md.simulate.nvt_nose_hoover_invariant(
+                                            self._energy_fn,
+                                            state,
+                                            self._temperature * TEMP_UNIT_CONVERSION,
+                                            nbrs_nm=nbrs_nm,
+                                            init_psi=init_psi,
+                                        )
+        elif self._routine == "NPT":
+            self._reporters["Pressure"] = lambda state, nbrs_nm, init_psi: self._pressure_fn(state, state.box, nbrs_nm, init_psi=init_psi)
+            self._reporters["box_x"] = lambda state, _, __: state.box[0]
+            self._reporters["Invariant"] = lambda state, nbrs_nm, init_psi: jax_md.simulate.npt_nose_hoover_invariant(
+                                            self._energy_fn,
+                                            state,
+                                            self._pressure * PRESS_UNIT_CONVERSION,
+                                            self._temperature * TEMP_UNIT_CONVERSION,
+                                            nbrs_nm=nbrs_nm,
+                                            init_psi=init_psi,
+                                        )
+        if self._use_model_deviation:
+            self._reporters["Model_Devi"] = lambda state, nbrs_nm, init_psi: jnp.array([
+            # self._reporters["Model_Devi"] = lambda state, nbrs_nm, init_psi: jnp.linalg.norm(jnp.array([
+                -jax.grad(fn)(
+                    state.position,
+                    box=state.box if "NPT" in self._routine else self._initial_box,
+                    nbrs_nm=nbrs_nm,
+                    init_psi=init_psi,
+                )
+                for fn in self._deviation_energy_fns
+            ]).std(axis=0).max()
+            # ]).std(axis=0), axis=-1).sum()
+
+        def report_fn(state, nbrs_nm, init_psi):
+            return [fn(state, nbrs_nm, init_psi) for fn in self._reporters.values()]
+        return jax.jit(report_fn)
+
+    def _print_report(self):
+        '''
+            Print a report of the current state.
+            All reports are accumulated in self.log.
+        '''
+        char_space = ["8"] + ["12"] * len(self._reporters) + ["6"]
+        if self._is_initial_state:
+            headers = ["Step"] + list(self._reporters.keys()) + ["Time"]
+            if self._debug and self._static_args['use_neighbor_list']:
+                headers += ["NbrUpdateRate"]
+                char_space += ["6"]
+            print(" ".join([f"{header:{char_space[i]}}" for i, header in enumerate(headers)]))
+        report = [self.step] + self._report_fn(
+                                    self._state,
+                                    self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None,
+                                    init_psi=self._current_psi
+                                ) + [time() - self._tic_between_report]
+        if self._debug and self._static_args['use_neighbor_list']:
+            char_space += ["6"]
+            report += [self._neighbor_update_profile.item()]
+        self.log.append(report)
+        print(f"{report[0]:<8d} " + " ".join([f"{value:<{char_space[i+1]}.3f}" for i, value in enumerate(report[1:])]))
+        self._tic_between_report = time()
+
+    def _construct_nbr_and_nbr_fn(self, position=None):
+        '''
+            Initial construction, or reconstruction when dr_buffer_neighbor or neighbor_buffer_ratio changes.
+        '''
+        self._typed_nbr_fn = typed_neighbor_list(self._current_box,
+                                                 self._type_idx,
+                                                 self._type_count,
+                                                 self._model.params['rcut'] + self._neighbor_skin,
+                                                 self._neighbor_buffer_ratio)
+        self._typed_nbrs = self._typed_nbr_fn.allocate(self._getRealPosition(position),
+                                                       box=self._current_box)
+
+    def _get_check_hard_overflow_fn(self):
+
+        def check_hard_overflow(state, typed_nbrs):
+            '''
+                Check if there is any overflow that requires recompilation. Jit-compatible.
+                Error code is a binary combination:
+                    1: Box shrunk too much with nbrs: Increase self._neighbor_skin or disable neighbor list
+                    2: Neighbor list buffer overflow: Reallocate neighbor list
+                    4: Neighbor list buffer overflow the previous step/chunk
+                    8: Lattice overflow: Increase lattice candidate/neighbor count
+                    16: Nan or Inf encountered in coordinates or velocities
+            '''
+            error_code = 0
+            if self._static_args['use_neighbor_list']:
+                if "NPT" in self._routine:
+                    error_code += (((1 - state.box[0] / typed_nbrs.reference_box[0]) > \
+                                    0.8 * self._neighbor_skin / (self._model.params['rcut'] + self._neighbor_skin))
+                                    | (state.box[0] < 2 * (self._model.params['rcut'] + self._neighbor_skin) * 1.02))
+                error_code += 2 * (typed_nbrs.did_buffer_overflow > 0)
+            is_nan = jnp.isnan(state.position).any() | jnp.isnan(state.velocity).any()
+            is_inf = jnp.isinf(state.position).any() | jnp.isinf(state.velocity).any()
+            error_code += 16 * (is_nan | is_inf)
+            return error_code
+        return check_hard_overflow
+
+    def _resolve_error_code(self):
+        '''
+            If error code is not 0 or 4, resolve the overflow and return 0 or 4.
+            In this case it is not jit compatible, and regenerates arguments/functions with static information.
+            If error code is 0 or 4, return 0.
+        '''
+        FLAG_4 = False
+        if self._error_code & 1: # Box shrunk too much
+            self._neighbor_skin += 0.4
+            if self._check_if_use_neighbor_list():
+                self._construct_nbr_and_nbr_fn()
+            else:
+                self._static_args = self._get_static_args(self._state.position, use_neighbor_list=False)
+        elif self._error_code & 2: # Need to reallocate neighbor list
+            if self._error_code & 4: # Neighbor list buffer overflow twice
+                self._neighbor_buffer_ratio += 0.05
+                self._construct_nbr_and_nbr_fn()
+            else: # Neighbor list buffer overflow once, simply reallocate
+                self._typed_nbrs = self._typed_nbr_fn.allocate(self._getRealPosition(),
+                                                               box=self._current_box)
+            FLAG_4 = True
+        elif self._error_code & 8: # Not fully implemented yet!!!
+            self._static_args = self._get_static_args(self._state.position, use_neighbor_list=False)
+
+        # After resolving the error, reset the error code and regenerate functions
+        if not (self._error_code == 0 or self._error_code == 4):
+            print("# Successfully resolved overflow code", self._error_code)
+            self._gen_fn()
+        self._error_code = 4 if FLAG_4 else 0
+
+    def _keep_nbr_or_lattice_up_to_date(self):
+        '''
+            After a run finishes, the state is still one step ahead of the neighbor list or lattice.
+            Call this function to ensure that the neighbor list or lattice is up-to-date.
+        '''
+        if self._static_args['use_neighbor_list']:
+            self._typed_nbrs, _ = jax.jit(self._soft_update_nbrs)(
+                                                    self._typed_nbrs,
+                                                    self._state.position * self._state.box if "NPT" in self._routine else self._state.position,
+                                                    self._current_box,
+                                                    self._neighbor_update_profile
+                                                )
+            self._error_code = jax.jit(self._check_hard_overflow)(self._state, self._typed_nbrs)
+        else:
+            self._error_code = jax.jit(self._check_hard_overflow)(self._state, None)
+        self._resolve_error_code()
+
+    def _get_soft_update_nbrs_fn(self):
+        '''
+            A lazy jit-compatible update of neighbor list.
+            Intuition: only update if atoms have moved more than dr_buffer_neighbor/2.
+        '''
+
+        def soft_update_nbrs(typed_nbrs, position, box, profile):
+            scale = typed_nbrs.reference_box[0] / box[0]
+            scaled_position = (position % box) * scale
+            scaled_position = scaled_position[self._type_idx.argsort(kind='stable')]
+            scaled_position = reorder_by_device(scaled_position, self._type_count)
+            rcut, dr = self._model.params['rcut'], self._neighbor_skin
+            safe_scale = scale * 1.02 if "NPT" in self._routine else scale
+            allowed_movement = ((rcut + dr) - rcut * safe_scale) / 2
+            max_movement = norm_ortho_box(
+                                    scaled_position - typed_nbrs.reference_position,
+                                    typed_nbrs.reference_box
+                                ).max()
+            update_required = max_movement > allowed_movement - typed_nbrs.reference_box[0] * 1e-6
+            profile = profile * (1 - 1/100) + 1/100 * update_required
+            typed_nbrs = jax.lax.cond(
+                                update_required,
+                                lambda: self._typed_nbr_fn.update(
+                                    position,
+                                    typed_nbrs,
+                                    box=box),
+                                lambda: typed_nbrs
+                            )
+            return typed_nbrs, profile
+
+        return soft_update_nbrs
+
+    def _get_inner_step(self):
+        '''
+            Returns a jitted function that performs multiple simulation steps.
+        '''
+        def inner_step(states, _):
+            '''
+                Performs a single simulation step.
+            '''
+            state, typed_nbrs, error_code, profile, psi = states
+            current_box = state.box if "NPT" in self._routine else self._initial_box
+
+            # soft update neighbor list before a step
+            if self._static_args['use_neighbor_list']:
+                typed_nbrs, profile = self._soft_update_nbrs(typed_nbrs,
+                                                             self._getRealPosition(state.position, current_box),
+                                                             current_box,
+                                                             profile)
+
+            # check if there is any hard overflow
+            error_code = error_code | self._check_hard_overflow(state, typed_nbrs)
+
+            # apply the simulation step
+            state = self._apply_fn(
+                                state,
+                                nbrs_nm=typed_nbrs.nbrs_nm if typed_nbrs else None,
+                                init_psi=psi,
+                            )
+
+            return ((state, typed_nbrs, error_code, profile, psi),
+                    (state.position * state.box if "NPT" in self._routine else state.position,
+                     state.velocity, 
+                     state.box if "NPT" in self._routine else self._initial_box,
+                    ))
+
+        @partial(jax.jit, static_argnums=(1,))
+        def multiple_inner_step(states, length):
+            '''
+                states = (state, typed_nbrs, error_code, profile)
+            '''
+            return jax.lax.scan(inner_step, states, length=length)
+
+        return multiple_inner_step
+
+    def _initialize_run(self, steps):
+        '''
+            Reset trajectory for each new run; 
+            if the simulation has not been run before, include the initial state.
+            Initialize run variables.
+        '''
+        print(f'# Running {steps} steps...')
+        traj_length = steps + int(self._is_initial_state)
+        self._offset = self.step - int(self._is_initial_state)
+        traj_dtype = np.float64 if jax.config.read('jax_enable_x64') else np.float32
+        # preallocate space for trajectory
+        try:
+            # if traj_length * self._natoms > 5e8:
+            #     print(f"# Warning: A single long run may cause out-of-memory to store the trajectory depending on available RAM. It is safer to split into multiple run(steps) and save/postprocess the segment after each run.")
+            # safe_buffer = np.zeros((traj_length, 3*self._natoms, 3), dtype=traj_dtype)
+            # del safe_buffer
+            # gc.collect()
+            self._position_trajectory = np.empty((traj_length, self._natoms, 3), dtype=traj_dtype)
+            self._velocity_trajectory = np.empty((traj_length, self._natoms, 3), dtype=traj_dtype)
+            self._box_trajectory = np.empty((traj_length,) + self._current_box.shape, dtype=traj_dtype)
+            self._center_trajectory = []
+            self._cv_trajectory = []
+        except MemoryError:
+            raise MemoryError("Trajectory too large to fit in CPU RAM. Split into multiple run(steps) and save/postprocess the segment after each run.")
+        if self._is_initial_state:
+            self._position_trajectory[0] = self.getPosition()
+            self._velocity_trajectory[0] = self.getVelocity()
+            self._box_trajectory[0] = self.getBox()
+            if self._model.params['type'] == 'dplr_q1':
+                self._current_psi, current_center, VH, dHC = self._update_psi_fn(
+                    self._state.position,
+                    self._current_box,
+                    self._current_psi,
+                    nbrs_nm=self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None
+                )
+                self._center_trajectory.append(np.array(current_center))
+                self._cv_trajectory.append(np.array([VH, dHC]))
+        self._tic_of_this_run = time()
+        self._tic_between_report = time()
+        self._error_code = 0
+        self._print_report()
+        self._is_initial_state = False
+
+    def run(self, steps):
+        '''
+            Run the simulation for a number of steps.
+        '''
+
+        self._initialize_run(steps)
+        beginning_step = self.step
+        remaining_steps = steps
+        while remaining_steps > 0:
+
+            # run the simulation for a jit-compiled chunk of steps
+            next_chunk = min(self.report_interval - self.step % self.report_interval,
+                             self._step_chunk_size,
+                             remaining_steps)
+            states = (self._state,
+                      self._typed_nbrs if self._static_args['use_neighbor_list'] else None,
+                      self._error_code,
+                      self._neighbor_update_profile,
+                      self._current_psi)
+            states_new, traj = self._multiple_inner_step_fn(states, next_chunk)
+            state_new, typed_nbrs_new, error_code, profile, _ = states_new
+            self._error_code |= error_code
+
+            if self._error_code & 16:
+                print("# Warning: Nan or Inf encountered in simulation. Terminating.")
+                remaining_steps = 0
+
+            # If there is any hard overflow, we have to re-run the chunk
+            if not (self._error_code == 0 or self._error_code == 4 or self._error_code == 16):
+                self._resolve_error_code()
+                continue
+
+            # If nothing overflows, update the tracked state and record the trajectory
+            self._keep_nbr_or_lattice_up_to_date()
+            if self._model.params['type'] == 'dplr_q1':
+                self._current_psi, current_center, VH, dHC = self._update_psi_fn(
+                    state_new.position,
+                    self._current_box,
+                    self._current_psi,
+                    nbrs_nm=self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None
+                )
+            self._state = state_new
+            self._typed_nbrs = typed_nbrs_new
+            self._neighbor_update_profile = profile
+            if "NPT" in self._routine:
+                self._current_box = self._state.box
+            pos_traj, vel_traj, box_traj = traj
+            idx_l, idx_r = self.step - self._offset, self.step - self._offset + next_chunk
+            self._position_trajectory[idx_l:idx_r] = pos_traj
+            self._velocity_trajectory[idx_l:idx_r] = vel_traj
+            self._box_trajectory[idx_l:idx_r] = box_traj
+            self.step += next_chunk
+            remaining_steps -= next_chunk
+
+            # Report at preset regular intervals
+            if self.step % self.report_interval == 0 or remaining_steps == 0:
+                self._print_report()
+                if self._model.params['type'] == 'dplr_q1':
+                    self._center_trajectory.append(np.array(current_center))
+                    self._cv_trajectory.append(np.array([VH, dHC]))
+
+        self._print_run_profile(steps, time() - self._tic_of_this_run)
+        self._keep_nbr_or_lattice_up_to_date()
+        trajectory = {
+            'position': self._position_trajectory,
+            'velocity': self._velocity_trajectory,
+            'box': self._box_trajectory,
+        }
+        if self._model.params['type'] == 'dplr_q1':
+            trajectory['center'] = np.array(self._center_trajectory)
+            trajectory['cv'] = np.array(self._cv_trajectory)
+        self._position_trajectory, self._velocity_trajectory = None, None
+        return trajectory
+
+    def _print_run_profile(self, steps, elapsed_time):
+        '''
+            Print the profile of the run. Called at the end of each run(steps).
+        '''
+        steps_per_microsecond_per_atom = 1e-6 * steps * self._state.position.shape[0]/ (elapsed_time + 1e-6)
+        nanosecond_per_day = 1e-6 * steps * self._dt * (86400 / elapsed_time)
+        print('# Finished %d steps in %dh %dm %ds.' %
+                    (steps, elapsed_time // 3600, (elapsed_time % 3600) // 60, elapsed_time % 60))
+        print('# Performance: %.3f ns/day, %.3f step/μs/atom' % (nanosecond_per_day, steps_per_microsecond_per_atom))
+
+    def _getRealPosition(self, position=None, box=None):
+        '''
+            Returns the real space position (Å) of the atoms.
+        '''
+        box = self._current_box if (box is None) else box
+        if position is None:
+            position = self._state.position
+        if not "NPT" in self._routine:
+            return position
+        elif box.size == 3:
+            return position * box
+        else:
+            return position @ box
+
+    def getPosition(self):
+        '''
+            Returns the current position (Å) of the atoms.
+        '''
+        return np.array(self._getRealPosition())
+
+    def setPosition(self, position):
+        '''
+            Set the position (Å) of the atoms. Must be the same shape as the initial position representing the same atom types.
+        '''
+        if position.shape != self._state.position.shape:
+            raise ValueError("Position must have the same shape as the initial position, or you have to create a new Simulation instance.")
+        self._state = self._state.set(position=position)
+        self._keep_nbr_or_lattice_up_to_date()
+        self._state = self._state.set(force=jax.jit(self._force_fn)(
+                            self._state.position,
+                            box=self._current_box,
+                            nbrs_nm=self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None,
+                            init_psi=self._current_psi,
+                        ))
+
+    def getVelocity(self):
+        '''
+            Returns the current velocity (Å/fs) of the atoms.
+        '''
+        return np.array(self._state.velocity)
+
+    def setVelocity(self, velocity):
+        '''
+            Set the velocity (Å/fs) of the atoms. Must be the same shape as the initial position representing the same system.
+        '''
+        self._state = self._state.set(momentum=self._state.mass * velocity)
+
+    def setRandomVelocity(self, temperature, remove_drift=True):
+        velocity = np.random.randn(self._natoms, 3)
+        velocity *= jnp.sqrt(TEMP_UNIT_CONVERSION * temperature / self._state.mass)
+        if remove_drift:
+            velocity -= (velocity * self._state.mass).sum(0) / self._state.mass.sum()
+        self.setVelocity(velocity)
+
+    def getBox(self):
+        '''
+            Returns the current box size (Å).
+        '''
+        return np.array(self._current_box)
+
+    def getEnergy(self):
+        '''
+            Returns the energy (eV) of the current state.
+        '''
+        return jax.jit(self._energy_fn)(
+                            self._state.position,
+                            box=self._current_box,
+                            nbrs_nm=self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None,
+                            init_psi=self._current_psi,
+                        ).item()
+
+    def getForce(self):
+        '''
+            Returns the force (eV/Å) of the current state.
+        '''
+        return np.array(self._state.force)
+
+    def getPressure(self):
+        '''
+            Returns the pressure (bar) of the current state.
+        '''
+        return jax.jit(self._pressure_fn)(
+                                self._state,
+                                self._current_box,
+                                self._typed_nbrs.nbrs_nm if self._static_args['use_neighbor_list'] else None,
+                                init_psi=self._current_psi,
+                            ).item()
+
+
+class TrajDump:
+    def __init__(
+        self,
+        atoms: Atoms,
+        fname: str,
+        interval: int,
+        vel: bool = False,
+        **kwargs,
+    ) -> None:
+        self.fname = fname
+        self.interval = interval
+        self.vel = vel
+        self.atoms = atoms
+
+        self.write_settings = kwargs
+
+    def write(self, positions, cell):
+        self.atoms.set_positions(positions)
+        self.atoms.set_cell(cell)
+        io.write(
+            self.fname,
+            self.atoms,
+            **self.write_settings,
+        )
+
+
+class TrajDumpSimulation(Simulation):
+    """
+    Example
+    -------
+    # setup simulation
+    sim = TrajDumpSimulation(
+        model_path="model.pkl",  # Has to be an 'energy' or 'dplr' model
+        box=box,  # Angstroms
+        type_idx=type_idx,  # here the index-element map (e.g. 0-Oxygen, 1-Hydrogen) must match the dataset used to train the model
+        mass=[15.9994, 1.0078, 195.08],  # Oxygen, Hydrogen
+        routine="NVT",  # 'NVE', 'NVT', 'NPT' (Nosé-Hoover)
+        dt=0.5,  # femtoseconds
+        initial_position=initial_position,  # Angstroms
+        temperature=330,  # Kelvin
+        report_interval=10,  # Report every 100 steps
+        seed=np.random.randint(1, 1e5),  # Random seed
+    )
+
+    sim.run(
+        n_steps,
+        [
+            TrajDump(atoms, "pos_traj.xyz", 10, append=True),
+            TrajDump(atoms, "vel_traj.xyz", 10, vel=True, append=True),
+        ],
+    )
+
+    """
+
+    def __init__(
+        self,
+        model_path,
+        box,
+        type_idx,
+        mass,
+        routine,
+        dt,
+        initial_position,
+        log_file: Optional[str] = "deepmd_jax.stdout",
+        **kwargs,
+    ):
+        super().__init__(
+            model_path,
+            box,
+            type_idx,
+            mass,
+            routine,
+            dt,
+            initial_position,
+            **kwargs,
+        )
+        self.log_file = log_file
+        if log_file is not None:
+            # export all stdout to log_file
+            self._stdout = sys.stdout
+            sys.stdout = open(log_file, "w", encoding="utf-8")
+
+    def __del__(self):
+        if self.log_file is not None:
+            sys.stdout.close()
+            sys.stdout = self._stdout
+
+    def _initialize_run(self, steps):
+        """
+        Reset trajectory for each new run;
+        if the simulation has not been run before, include the initial state.
+        Initialize run variables.
+        """
+        print(f"# Running {steps} steps...")
+        self._offset = self.step - int(self._is_initial_state)
+        self._tic_of_this_run = time()
+        self._tic_between_report = time()
+        self._error_code = 0
+        self._print_report()
+        self._is_initial_state = False
+
+    def run(self, steps, dump_list: List[TrajDump]):
+        """
+        Run the simulation for a number of steps.
+        """
+        self._initialize_run(steps)
+        remaining_steps = steps
+        while remaining_steps > 0:
+            # run the simulation for a jit-compiled chunk of steps
+            next_chunk = min(
+                self.report_interval - self.step % self.report_interval,
+                self._step_chunk_size,
+                remaining_steps,
+            )
+            states = (
+                self._state,
+                self._typed_nbrs if self._static_args["use_neighbor_list"] else None,
+                self._error_code,
+                self._neighbor_update_profile,
+            )
+            states_new, traj = self._multiple_inner_step_fn(states, next_chunk)
+            state_new, typed_nbrs_new, error_code, profile = states_new
+            self._error_code |= error_code
+
+            if self._error_code & 16:
+                print("# Warning: Nan or Inf encountered in simulation. Terminating.")
+                remaining_steps = 0
+
+            # If there is any hard overflow, we have to re-run the chunk
+            if not (
+                self._error_code == 0 or self._error_code == 4 or self._error_code == 16
+            ):
+                self._resolve_error_code()
+                continue
+
+            # If nothing overflows, update the tracked state and record the trajectory
+            self._keep_nbr_or_lattice_up_to_date()
+            self._state = state_new
+            self._typed_nbrs = typed_nbrs_new
+            self._neighbor_update_profile = profile
+            if "NPT" in self._routine:
+                self._current_box = self._state.box
+            pos_traj, vel_traj, box_traj = traj
+            self.step += next_chunk
+            remaining_steps -= next_chunk
+
+            # Report at preset regular intervals
+            if self.step % self.report_interval == 0 or remaining_steps == 0:
+                self._print_report()
+
+            for dump in dump_list:
+                if self.step % dump.interval == 0 or remaining_steps == 0:
+                    cell = np.concatenate([np.array(box_traj[-1]), [90, 90, 90]])
+                    dump.write(pos_traj[-1] if not dump.vel else vel_traj[-1], cell)
+
+        self._print_run_profile(steps, time() - self._tic_of_this_run)
+        self._keep_nbr_or_lattice_up_to_date()
