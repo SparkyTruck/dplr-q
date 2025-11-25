@@ -53,7 +53,7 @@ import numpy as np
 initial_position = np.load('water_64_with_e_and_H.npy')
 sim = Simulation(
     model_path = 'model_e_and_H.pkl',
-    grid_size = 48,
+    grid_size = 48, # recommends around box*4 with a number with small prime factors
     box=12.4171,
     type_idx=np.array([0,1,1] * 64 + [1]),
     mass=[15.9994, 1.0078],
@@ -68,4 +68,6 @@ trajectory = sim.run(2000)
  # predicted electron centers are recorded every report_interval
 assert trajectory['center'].shape == trajectory['position'][::10].shape
 ```
+
+### Miscellaneous
 The `scripts` directory contains simulation and post-processing scripts for the specific system e⁻(aq) + H⁺(aq) → H·(aq), which are less organized and intended mainly for ad-hoc analysis.
