@@ -1,5 +1,5 @@
 from deepmd_jax.train import train, evaluate
-from deepmd_jax.md_solve import Simulation
+from deepmd_jax.md import Simulation
 import numpy as np
 import argparse
 parser = argparse.ArgumentParser()

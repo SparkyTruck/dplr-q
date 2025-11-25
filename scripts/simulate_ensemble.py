@@ -1,5 +1,5 @@
 from deepmd_jax.train import train, evaluate
-from deepmd_jax.md_solve import Simulation
+from deepmd_jax.md import Simulation
 from scripts.utils import jit_analyze_traj
 import numpy as np
 import argparse

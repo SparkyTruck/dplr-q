@@ -1,6 +1,6 @@
 # Deep-Potential Long-Range Quantum
 
-This is the implementation of Deep-Potential Long-Range Quantum where an excess electron is present in the system and explicitly modeled, while the long-range Coulomb interaction and short-range interaction are treated by a Deep Potential model. The code is only for the purpose for the setting in the paper and include system-specific snippets, and modifications may be needed to apply to other systems. For the general purpose repo, please refer to [deepmd-jax](https://github.com/SparkyTruck/deepmd-jax).
+This is the implementation of Deep-Potential Long-Range Quantum (DPLR-q), where an excess electron is present in the system and explicitly modeled, while the long-range Coulomb interaction and short-range interaction are treated by a Deep Potential model. The code is mostly only for reproducing the results in the associated paper (...link to be added later...). It includes system-specific snippets, and modifications may be needed to apply to other systems. For the general-purpose DP/DPLR in jax, please refer to [deepmd-jax](https://github.com/SparkyTruck/deepmd-jax).
 
 ## Installation
 Note: You need to first have **CUDA 12** installed for GPU support.
@@ -10,13 +10,13 @@ cd dplr-q
 pip install -e .
 ```
 
-## training a model
+## Training a model
 
 The dataset from DFT is available on [Zenodo](https://doi.org/10.5281/zenodo.17684097).
 ```python
 from deepmd_jax.train import train
 ```
-First, train a Wannier centroid model.
+First, train a Wannier centroid model:
 ```python
 train(
         model_type='atomic',
@@ -27,6 +27,7 @@ train(
         atomic_sel=[0],
         step=100000,
     )
+```
 Next, train the short-range model. The saved model includes both the Wannier centroid model and the short-range model.
 ```python
 train(
@@ -47,7 +48,6 @@ train(
 ## Simulation
 
 ```python
-# cleaned code interface
 from deepmd_jax.md import Simulation
 import numpy as np
 initial_position = np.load('water_64_with_e_and_H.npy')
@@ -65,7 +65,7 @@ sim = Simulation(
     report_interval=10,
 )
 trajectory = sim.run(2000)
-assert trajectory['center'].shape == trajectory['position'][::10].shape # predicted electron centers are recorded every report_interval
+ # predicted electron centers are recorded every report_interval
+assert trajectory['center'].shape == trajectory['position'][::10].shape
 ```
-
-./scripts contains some post-processing scripts for this specific system, which are less organized and for reference only.
+The `scripts` directory contains simulation and post-processing scripts for the specific system e⁻(aq) + H⁺(aq) → H·(aq), which are less organized and intended mainly for ad-hoc analysis.

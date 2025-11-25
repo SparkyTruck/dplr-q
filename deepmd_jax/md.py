@@ -427,16 +427,12 @@ class Simulation:
 
         if model_and_variables is None:
             model_and_variables = (self._model, self._variables)
-            # model_and_variables_list = [load_model(path)) for path in self._model_deviation_paths]
-            # load_model(path)) for path in self._model_deviation_paths
         model, variables = model_and_variables
         if 'dplr' in model.params['type']:
             if self._current_box.size > 3:
-                raise NotImplementedError("dplr-q1 model currently only supports orthorhombic box")
+                raise NotImplementedError("dplr model currently only supports orthorhombic box")
             if 'NPT' in self._routine:
                 raise NotImplementedError("needs a bit more editing to work with NPT")
-            # q_coord = np.repeat(np.array([6,1]), self._type_count)
-            # q_wc = np.repeat(np.array([-8]), self._type_count[self._w_model.params['nsel']])
             q_coord = jnp.array(np.repeat(model.params['dplr_q_atoms'], self._type_count))
             q_wc = jnp.array(np.repeat(model.params['dplr_q_wc'],
                                       [self._type_count[i] for i in self._w_model.params['nsel']]))
@@ -445,155 +441,21 @@ class Simulation:
                 M = [self._grid_size] * 3 if type(self._grid_size) is int else list(self._grid_size)
             else:
                 M = get_p3mlr_grid_size(np.array(self._current_box), beta = 1, resolution = self._model.params['dplr_resolution'])
-            if self._current_psi is None and 'dplr_q1' in model.params['type']:
-                self._current_psi = jax.random.normal(jax.random.PRNGKey(0), M, jnp.float64 if jax.config.read('jax_enable_x64') else jnp.float32)
-                self._current_psi /= jnp.linalg.norm(self._current_psi)
             p3mlr_fn = get_p3mlr_fn(self._current_box, model.params['dplr_beta'], M=M)
-            solve_E_electron, get_V_grid, ground_state, berry_center, get_VH = get_schrodinger_1e_fn(
-                box3=self._current_box,
-                beta0=model.params['dplr_q1_beta'],
-                w_model=self._w_model,
-                w_variables=self._w_variables,
-                dplr_q_atoms=model.params['dplr_q_atoms'],
-                dplr_q_wc=model.params['dplr_q_wc'],
-                static_args=self._static_args,
-                M=M,
-            )            
-        # k = 2*jnp.pi*jnp.fft.fftfreq(M[0], d=self._current_box[0]/M[0])
-        # kgrid = jnp.stack(jnp.meshgrid(k, k, k, indexing='ij'), axis=0)
-        # k2 = jnp.sum(kgrid**2, axis=0)
-        # k2factor = 4 * jnp.pi / self._current_box[0]**3 * jnp.where(k2 == 0, 0, 1/k2) #* jnp.exp(-k2/(4*beta**2))
-        # def get_V(coords, wc):
-        #     # return jnp.zeros(M) # --- IGNORE ---
-        #     V_k = (jnp.exp(-1j * (jnp.concatenate([coords, wc]) @ kgrid.reshape(3, -1))) * q[:, None]).sum(0)
-        #     V_k = V_k.reshape(M[0], M[1], M[2]) * k2factor * jnp.exp(-k2/(4*self._beta0**2))
-        #     # V_k_O = (jnp.exp(-1j * (coords[:64] @ kgrid.reshape(3, -1))) * (8 * jnp.ones((64, 1)))).sum(0)
-        #     # V_k_H = (jnp.exp(-1j * (coords[64:] @ kgrid.reshape(3, -1))) * jnp.ones((129, 1))).sum(0)
-        #     # V_k_wc = (jnp.exp(-1j * (wc @ kgrid.reshape(3, -1))) * (-8 * jnp.ones((64, 1)))).sum(0)
-        #     # V_k_O_reshape = V_k_O.reshape(M[0], M[1], M[2])
-        #     # V_k_O = V_k_O_reshape * k2factor * jnp.exp(-k2/(4*self._beta_O**2))
-        #     # V_k_wc = V_k_wc.reshape(M[0], M[1], M[2]) * k2factor * jnp.exp(-k2/(4*self._beta_O**2))
-        #     # V_k_H = V_k_H.reshape(M[0], M[1], M[2]) * k2factor * jnp.exp(-k2/(4*self._beta_H**2))
-        #     # V_k_HO = -2/8 * V_k_O_reshape * k2factor * jnp.exp(-k2/(4*self._beta_H**2))
-        #     # V_k = V_k_O + V_k_H + V_k_wc + V_k_HO
-        #     V_k_sym = V_k.copy()
-        #     for axis in (0,1,2):
-        #         V_k_sym = jnp.roll(jnp.flip(V_k_sym, axis=axis), 1, axis=axis)
-        #     V_k = -14.399645 * 0.5 * (V_k + V_k_sym.conj())
-        #     V = jnp.fft.ifftn(V_k).real * M[0]**3
-        #     return V
-            # real_grid = (self._current_box/np.array(M))[:,None,None,None] * jnp.stack(jnp.meshgrid(*[jnp.arange(m) for m in M], indexing='ij'), axis=0)
-            # cube_idx = (jnp.stack(jnp.meshgrid(*([jnp.array([-1,0,1])]*3),indexing='ij'))).reshape(3,27)
-            # kgrid = jnp.stack(jnp.meshgrid(*[jnp.arange(m) for m in M], indexing='ij'))
-            # MM = jnp.array(M).reshape(3,1,1,1)
-            # kgrid = 2*jnp.pi/self._current_box[:,None,None,None] * ((kgrid-MM/2)%MM-MM/2)
-            # ksquare = (kgrid ** 2).sum(0)
-            # z = kgrid * (self._current_box/jnp.array(M))[:,None,None,None] / 2
-            # sinz = jnp.sin(z)
-            # w3k = jnp.prod(jnp.where(z==0, 1, (sinz/z)**3), axis=0)
-            # Sk = jnp.prod(1 - sinz**2 + 2/15*sinz**4, axis=0)
-            # kfactor = -(14.399645*4*jnp.pi*jnp.prod(jnp.array(M))/jnp.prod(self._current_box)) * jnp.exp(-ksquare/(4*model.params['dplr_q1_beta']**2)) * w3k/(Sk*ksquare)
-            # kfactor = kfactor.at[0,0,0].set(0.)
-            # p3mlr_fn = get_p3mlr_fn(self._current_box, model.params['dplr_beta'], M=M)
-        # def get_V(coords, wc):
-        #     coord_N3 = jnp.concatenate([coords, wc])
-        #     grid = jnp.zeros(M)
-        #     M3 = jnp.array(M)
-        #     coord_3N = ((coord_N3 % self._current_box) / self._current_box * M3).T
-        #     center_idx_3N = jnp.rint(coord_3N).astype(int) # in [0, M3]
-        #     r_3N = coord_3N - center_idx_3N # lies in (-0.5, 0.5)
-        #     fr_33N = jnp.stack([(r_3N-0.5)**2/2,
-        #                         0.75 - r_3N**2,
-        #                         (r_3N+0.5)**2/2]) # TSC assignment
-        #     fr_27N = (fr_33N[:,None,None,0,:]*fr_33N[:,None,1,:]*fr_33N[:,2,:]).reshape(27,-1)
-        #     all_idx = (center_idx_3N[:,None] + cube_idx[:,:,None]).reshape(3,-1) % M3[:,None]
-        #     grid = grid.at[tuple(all_idx)].add((q*fr_27N).reshape(-1))
-        #     grid = jnp.fft.ifftn(jnp.fft.fftn(grid) * kfactor).real
-        #     return grid
-        # def ground_state(V, psi, tol=1e-4, max_step=100):
-        #     n3, h3 = V.shape, self._current_box / np.array(V.shape)
-        #     dk  = [2*jnp.pi * jnp.fft.fftfreq(n, d=h) for n, h in zip(n3, h3)]
-        #     T_k = 3.809982 * (dk[0][:,None,None]**2 + dk[1][None,:,None]**2 + dk[2][None,None,:]**2)
-        #     mu = jnp.clip(0.5 * jnp.std(V), 1e-4 * T_k.max(), 0.05 * T_k.max())
-        #     psi_k = jnp.fft.fftn(psi)
-        #     E = ((psi.conj() * psi).real * V).sum() + ((psi_k * psi_k.conj()).real * T_k).sum() / psi.size
-        #     def step(state):
-        #         for i in range(4):
-        #             psi, psi_k, E, _, k = state
-        #             psi_k_conj = psi_k.conj()
-            #         res_k = jnp.fft.fftn(V * psi) + (T_k - E) * psi_k
-            #         res_norm = jnp.sqrt((jnp.abs(res_k)**2).sum() / psi.size)
-            #         z_k = res_k / (T_k + mu) # preconditioner
-            #         z_k = z_k - (z_k * psi_k_conj).sum() * psi_k / psi.size
-            #         b_k = z_k / (jnp.sqrt((jnp.abs(z_k)**2).sum() / psi.size))
-            #         b = jnp.fft.ifftn(b_k)
-            #         A12 = (psi.conj() * V * b).sum() + (psi_k_conj * T_k * b_k).sum() / psi.size
-            #         A22 = ((b.conj() * b).real * V).sum().real + ((b_k.conj() * b_k).real * T_k).sum() / psi.size
-            #         c0, c1 = (A22-E) + ((E-A22)**2 + 4*(A12*A12.conj()).real)**0.5, -2*A12.conj()
-            #         psi_new = c0 * psi + (c1 * b).real
-            #         normalizer =  (psi_new.conj() * psi_new).real.sum()**0.5
-            #         psi_new /= normalizer
-            #         psi_k_new = (c0 * psi_k + c1 * b_k) / normalizer
-            #         E_new = ((psi_new.conj() * psi_new).real * V).sum() + ((psi_k_new * psi_k_new.conj()).real * T_k).sum() / psi.size
-            #         # jax.debug.print('E: {E:.7f}, Enew: {E_new:.7f}, branch: {b}, c0: {c0}, k: {k}', E=E, E_new=E_new, b=branch, c0=c0, k=k)
-            #         state = (psi_new, psi_k_new, E_new, res_norm, k + 1)
-            #     return state
-            # def cond(state):
-            #     _, _, _, res_norm, k = state
-            #     # return k < 30
-            #     return (jnp.abs(res_norm) > tol) & (k < max_step)
-            # psi, _, E, _, k = jax.lax.while_loop(cond, step, (psi, psi_k, E, 1e10, 0))
-            # rho = jnp.abs(psi)**2 / h3.prod()
-            # return E, rho, psi, k
-        
-        # def ground_state(V, box, psi, tol=1e-6, c=4, decay=0.5, max_decay=4, max_step=2000):
-        #     n, h = V.shape[0], box / V.shape[0]
-        #     tau0 = c * h**2
-        #     dk  = 2*jnp.pi * jnp.fft.fftfreq(n, d=h)
-        #     T_k = 3.809982 * (dk[:,None,None]**2 + dk[None,:,None]**2 + dk[None,None,:]**2) / self._e_mass
-        #     def step(state):
-        #         for i in range(4):
-        #             psi, E_prev, tau, _, k = state
-        #             psi *= jnp.exp(-0.5 * tau * V)
-        #             psi  = jnp.fft.ifftn(jnp.exp(-tau * T_k) * jnp.fft.fftn(psi))
-        #             psi *= jnp.exp(-0.5 * tau * V)
-        #             psi /= jnp.linalg.norm(psi)
-        #             E_new = (psi.conj() * (jnp.fft.ifftn(T_k * jnp.fft.fftn(psi)) + V * psi)).real.sum()
-        #             # jax.debug.print('E_new: {E_new:.7f}, E_prev: {E_prev:.7f}, tau: {tau:.7f}, k: {k}', E_new=E_new, E_prev=E_prev, tau=tau, k=k)
-        #             dE = jnp.abs(E_new - E_prev)
-        #             tau = jnp.where((dE < tol*10) & (tau/tau0 > decay**(max_decay-0.5)), tau * decay, tau)
-        #             state = (psi, E_new, tau, dE, k + 1)
-        #         return state
-        #     def cond(state):
-        #         _, _, tau, dE, k = state
-        #         return ((jnp.abs(dE) > tol) | (tau/tau0 > decay**(max_decay-0.5))) & (k < max_step)
-        #     psi, E, _, _, k = jax.lax.while_loop(cond, step, (psi, 1e10, tau0, 1e10, 0))
-        #     rho = jnp.abs(psi)**2 / h**3
-        #     # jax.debug.print('Ground state converged: E = {E:.7f}, k = {k}', E=E, k=k)
-        #     return E, rho, psi, k
-        
-        # def solve_E_electron(coords, box, nbrs_nm, init_psi):
-        #     wc = self._w_model.wc_predict(self._w_variables, coords, box, self._static_args, nbrs_nm)
-        #     V = get_V(coords, wc)
-        #     E, rho, _, k = ground_state(V, init_psi)
-        #     # jax.debug.print("Iter k={k}", k=k)
-        #     E0 = (jax.lax.stop_gradient(rho) * V).sum() * (jnp.diag(box) / jnp.array(M)).prod()
-        #     E1 = jax.lax.stop_gradient(E - E0)
-        #     return E0 + E1, wc, rho
-
-        # if model.params['type'] == 'dplr':
-        #     if self._current_box.size > 3:
-        #         raise NotImplementedError("dplr model currently only supports orthorhombic box")
-        #     wc_model, wc_variables = model.params['dplr_wannier_model_and_variables']
-        # p3mlr_fn = get_p3mlr_fn(self._current_box, model.params['dplr_beta'], M=M)
-                            # model.params['dplr_beta'],
-                            # resolution=model.params['dplr_resolution'],
-                        # )
-            # qatoms = jnp.array(np.repeat(model.params['dplr_q_atoms'],
-            #                              self._type_count))
-            # qwc = jnp.array(np.repeat(model.params['dplr_q_wc'],
-            #                           [self._type_count[i] for i in wc_model.params['nsel']]))
-        
+            if model.params['type'] == 'dplr_q1':
+                if self._current_psi is None:
+                    self._current_psi = jax.random.normal(jax.random.PRNGKey(0), M, jnp.float64 if jax.config.read('jax_enable_x64') else jnp.float32)
+                    self._current_psi /= jnp.linalg.norm(self._current_psi)
+                solve_E_electron, get_V_grid, ground_state, berry_center, get_VH = get_schrodinger_1e_fn(
+                    box3=self._current_box,
+                    beta0=model.params['dplr_q1_beta'],
+                    w_model=self._w_model,
+                    w_variables=self._w_variables,
+                    dplr_q_atoms=model.params['dplr_q_atoms'],
+                    dplr_q_wc=model.params['dplr_q_wc'],
+                    static_args=self._static_args,
+                    M=M,
+                )        
 
         def energy_fn(coord, nbrs_nm, perturbation=1., **kwargs):
             '''
@@ -611,13 +473,8 @@ class Simulation:
                 coord = jax.lax.stop_gradient(coord @ box) + coord - jax.lax.stop_gradient(coord)
             # Atoms are reordered and grouped by type in neural network inputs
             coord = coord[self._type_idx.argsort(kind='stable')]
-            # perturbation = 1, required by jax-md pressure calculation
             coord = coord * perturbation
             box = box * perturbation
-            # Ensure coord and box is replicated on all devices
-            # sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-            # coord = jax.lax.with_sharding_constraint(coord, sharding)
-            # box = jax.lax.with_sharding_constraint(box, sharding)
             coord = jax.lax.with_sharding_constraint(coord, PSpec())
             box = jax.lax.with_sharding_constraint(box, PSpec())
 
@@ -640,11 +497,6 @@ class Simulation:
                 dHC = jnp.linalg.norm((center - Hyd - jnp.diag(box)/2) % jnp.diag(box) - jnp.diag(box)/2, axis=-1)
                 E -= VH_bias_fn_for_e_H_reaction(VH, dHC, len(coord) // 3)
             return E
-        # def berry_center(rho, box):
-        #     s = (jnp.exp(1j * 2*jnp.pi* (real_grid / box[:,None,None,None])) * rho).sum(axis=(1,2,3)) / rho.sum()
-        #     # sigma = jnp.linalg.norm((box / (2 * jnp.pi)) * jnp.sqrt(-2.0 * jnp.log(jnp.abs(s))))
-        #     center = (jnp.angle(s) * box / (2 * jnp.pi)) % box
-        #     return jax.lax.stop_gradient(center)
         def update_psi_fn(coords, box, init_psi, nbrs_nm):
             coords = coords[self._type_idx.argsort(kind='stable')]
             wc = self._w_model.wc_predict(self._w_variables, coords, jnp.diag(box), self._static_args, nbrs_nm)
@@ -655,20 +507,6 @@ class Simulation:
             VH, H = get_VH(coords, wc, center, box, nbrs_nm)
             dHC = jnp.linalg.norm((center - H - box/2) % box - box/2, axis=-1)
             return psi, center, VH, dHC
-        # def get_Hyd(coords, box):
-        #     N = coords.shape[0] // 3
-        #     O, H = coords[:N], coords[N:]
-        #     distOH = jnp.linalg.norm((O[:,None] - H[None] + box/2) % box - box/2, axis=-1)
-        #     H2_idx = jnp.argsort(distOH, axis=-1)[:,:2].reshape(2*N)
-        #     H_is_bonded = jnp.isin(jnp.arange(2*N+1), H2_idx)
-        #     return H[jnp.argsort(H_is_bonded)[0]]
-        # def get_VH(coords, wc, center, box, nbrs_nm):
-        #     V = get_V(coords, wc)
-        #     Hyd = get_Hyd(coords, box)
-        #     N = coords.shape[0] // 3
-        #     # Hyd = coords[N + jnp.argmin(jnp.linalg.norm((coords[N:] - center - box/2) % box - box/2, axis=-1))]
-        #     return (jnp.fft.fftn(V) * jnp.exp(1j * (Hyd[:,None,None,None] * kgrid).sum(0))).sum().real / V.size, Hyd
-        #     # return (jnp.fft.fftn(V) * jnp.exp(1j * (Hyd[:,None,None,None] * kgrid).sum(0))).sum().real / V.size, get_Hyd(coords, box)
         self._update_psi_fn = jax.jit(update_psi_fn)
         return energy_fn
 
