@@ -89,7 +89,7 @@ The `scripts` directory contains simulation and post-processing scripts for the 
 
 # DWIR
 
-This repository also contains a research implementation of **Deep Wannier Iterative Refinement (DWIR)** for a single electron, a method to iteratively refine the prediction of Wannier centers of an electron not uniquely associated with any specific atom.
+This repository also contains a research implementation of **Deep Wannier Iterative Refinement (DWIR)** for a single electron, a method to iteratively refine the prediction of Wannier centers of an electron not uniquely associated with any specific atom, as described in the [previous work](https://doi.org/10.1039/D4CP01483A).
 
 Example code to train a DWIR model for the solavated electron system:
 ```python
