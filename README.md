@@ -1,6 +1,54 @@
-# Deep-Potential Long-Range Quantum
+# Deep-Potential Long-Range Quantum (DPLR-q)
 
-This is the implementation of Deep-Potential Long-Range Quantum (DPLR-q), where an excess electron is present in the system and explicitly modeled, while the long-range Coulomb interaction and short-range interaction are treated by a Deep Potential model. The code is mostly only for reproducing the results in the associated paper (...link to be added later...). It includes system-specific snippets, and modifications may be needed to apply to other systems. For the general-purpose DP/DPLR in jax, please refer to [deepmd-jax](https://github.com/SparkyTruck/deepmd-jax).
+This repository contains the research implementation of **Deep-Potential Long-Range Quantum (DPLR-q)**, an electron-aware machine-learning force field in which an *excess electron* is treated explicitly at the wave-function level, while long-range Coulomb interactions and short-range many-body interactions are modeled with a Deep Potential network.
+
+DPLR-q was developed and used in the work:
+
+> Ruiqi Gao, Pinchen Xie, and Roberto Car,  
+> **“A Machine Learning Model for the Chemistry of a Solvated Electron”**,  
+> arXiv:2511.22642 — <https://arxiv.org/abs/2511.22642>
+
+This code is primarily intended to **reproduce the results** reported in the associated paper, where there are **system-specific scripts and settings** tailored to the solvated-electron / hydronium system studied in the paper. Adapting DPLR-q to other systems could require modifications.
+
+For a **general-purpose** implementation of Deep Potential / DPLR models in JAX, please refer instead to:
+
+- [`deepmd-jax`](https://github.com/SparkyTruck/deepmd-jax)
+
+---
+
+## Pretrained models
+
+Pretrained models used in the paper (e.g., Wannier-centroid predictors and short-range energy models) are provided under:
+
+- `trained_models/`
+
+These can be loaded to reproduce the production simulations and analysis without retraining from scratch.
+
+---
+
+## Dependencies
+
+DPLR-q is built on top of the JAX implementation of Deep Potential:
+
+- Python (version as used in the paper)
+- [JAX](https://github.com/google/jax) with GPU support
+- [`deepmd-jax`](https://github.com/SparkyTruck/deepmd-jax)  
+- Standard scientific Python stack (`numpy`, `matplotlib`, etc.)
+
+Please install `deepmd-jax` and its dependencies following the instructions in that repository before using DPLR-q.
+
+---
+
+## Getting started
+
+A typical workflow is:
+
+1. **Set up the environment**
+
+   ```bash
+   git clone https://github.com/SparkyTruck/dplr-q.git
+   cd dplr-q
+   # install deepmd-jax first, then any extra requirements for this repo
 
 ## Installation
 Note: You need to first have **CUDA 12** installed for GPU support.
