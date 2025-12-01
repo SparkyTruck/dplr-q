@@ -14,44 +14,9 @@ For a **general-purpose** implementation of Deep Potential / DPLR models in JAX,
 
 - [`deepmd-jax`](https://github.com/SparkyTruck/deepmd-jax)
 
----
-
-## Pretrained models
-
-Pretrained models used in the paper (e.g., Wannier-centroid predictors and short-range energy models) are provided under:
-
-- `trained_models/`
-
-These can be loaded to reproduce the production simulations and analysis without retraining from scratch.
-
----
-
-## Dependencies
-
-DPLR-q is built on top of the JAX implementation of Deep Potential:
-
-- Python (version as used in the paper)
-- [JAX](https://github.com/google/jax) with GPU support
-- [`deepmd-jax`](https://github.com/SparkyTruck/deepmd-jax)  
-- Standard scientific Python stack (`numpy`, `matplotlib`, etc.)
-
-Please install `deepmd-jax` and its dependencies following the instructions in that repository before using DPLR-q.
-
----
-
-## Getting started
-
-A typical workflow is:
-
-1. **Set up the environment**
-
-   ```bash
-   git clone https://github.com/SparkyTruck/dplr-q.git
-   cd dplr-q
-   # install deepmd-jax first, then any extra requirements for this repo
 
 ## Installation
-Note: You need to first have **CUDA 12** installed for GPU support.
+Note: GPU is required for training and simulation.
 ```
 git clone https://github.com/SparkyTruck/dplr-q.git
 cd dplr-q
