@@ -111,7 +111,7 @@ train(
 
 The DWIR model does not play a part in molecular dynamics simulations, but it can be used as a Wannier center predictions in post-processing analysis of standard Deep Potential simulations. For DPLR-q, this is generally not necessary as it directly outputs the centers in the trajectory. However, DWIR can be somewhat more accurate in terms of just the centers.
 
-To inference the Wannier center for a given trajectory, start with a not-too-bad initial guess `init_wc` of shape `(1, 3)` for the first frame, and use the standard `evaluate` function:
+To inference the Wannier center for a given trajectory, use the [`evaluate`](https://github.com/SparkyTruck/deepmd-jax?tab=readme-ov-file#evaluating-a-model) function. For DWIR, an additional initial guess `init_wc` of shape `(1, 3)` for the first frame is needed (you can use a DFT-calculated center for the first frame).
 ```python
 from deepmd_jax.train import evaluate
 wannier_predictions = evaluate('trained_models/dwir_model.pkl', trajectory['position'], trajectory['box'], type_idx, init_wc=init_wc, n_iter=4)
