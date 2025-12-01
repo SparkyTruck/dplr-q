@@ -16,7 +16,7 @@ For a **general-purpose** implementation of Deep Potential / DPLR models in JAX,
 
 
 ## Installation
-Note: GPU is required for training and simulation.
+Note: The code is currently written to run on a single GPU.
 ```
 git clone https://github.com/SparkyTruck/dplr-q.git
 cd dplr-q
@@ -84,3 +84,35 @@ assert trajectory['center'].shape == trajectory['position'][::10].shape
 
 ### Miscellaneous
 The `scripts` directory contains simulation and post-processing scripts for the specific system e⁻(aq) + H⁺(aq) → H·(aq), which are less organized and intended mainly for ad-hoc analysis.
+
+---
+
+# DWIR
+
+This repository also contains a research implementation of **Deep Wannier Iterative Refinement (DWIR)** for a single electron, a method to iteratively refine the prediction of Wannier centers of an electron not uniquely associated with any specific atom.
+
+Example code to train a DWIR model for the solavated electron system:
+```python
+from deepmd_jax.train import train
+train(
+      model_type='atomic_iter',     
+      rcut=6.0,        
+      mp=True,
+      save_path=f'trained_models/dwir_model.pkl',
+      train_data_path=list_of_train_data_paths,
+      step=50000,
+      gamma_iter=2,   # loss coefficient in iterative refinement
+      n_iter=4,       # number of refinement iterations during training
+      perturb_iter=1, # purturbation strength (Angstrom) for initial guess
+      batch_size=32,
+      lr=0.01,
+)
+```
+
+The DWIR model does not play a part in molecular dynamics simulations, but it can be used as a Wannier center predictions in post-processing analysis of standard Deep Potential simulations. For DPLR-q, this is generally not necessary as it directly outputs the centers in the trajectory. However, DWIR can be somewhat more accurate in terms of just the centers.
+
+To inference the Wannier center for a given trajectory, start with a not-too-bad initial guess `init_wc` of shape `(1, 3)` for the first frame, and use the standard `evaluate` function:
+```python
+from deepmd_jax.train import evaluate
+wannier_predictions = evaluate('trained_models/dwir_model.pkl', trajectory['position'], trajectory['box'], type_idx, init_wc=init_wc, n_iter=4)
+```

@@ -32,10 +32,21 @@ def shift(coord, box, ortho=False): # shift coordinates to the parallelepiped ar
 def sr(r, rcut, z=0): # 1/r with smooth cutoff at rcut
     t = r / rcut
     cut = (t < 1) * (r > 1e-14)
+    # jax.debug.print("🤯 {x} 🤯", x=t.tangent)
+    # return cut / (r+1e-15) * (1-3*t**2+2*t**3)
     if z == 0: # standard 1/r
         return cut / (r+1e-15) * (1-3*t**2+2*t**3)
-    if z == 4: # zero at r=0, 2-order smooth at r = rcut
-        # raise NotImplementedError("sr with z=4 is no longer supported")
+    if z == 1: # finite at r=0, 2-order smooth at r = rcut
+        t = (t + -0.2 * t * (1-t))
+        return 0.7 * (1 - 3*t**2 + 2*t**3 - 2*t**2 * (t-1)**2 * (2-t)**2) * cut
+    if z == 2: # finite at r=0, used as a nn input
+        t = t + 0.5 * t * (1-t)
+        t = t + 0.5 * t * (1-t)
+        return 0.4 * (1 - t**2) * cut
+    if z == 3: # zero at r=0, 2-order smooth at r = rcut
+        t = (t - 0. * t * (1-t))
+        return 2 * t * (t - 1)**2 / (t + 0.1) * jnp.exp(-1.8 * t) * cut
+    if z == 4: # zero at r=0, 2-order smooth at r = rcu
         alpha = 1.5 / rcut
         A, B, C = (-alpha + 2/alpha), (2 - 3/alpha - 2/alpha**3), (alpha**2+1) / alpha**4
         ret = (A + B*t**2 + C*t**3) * (t < alpha) / rcut + (t >= alpha) / (r+1e-15) * (1-3*t**2+2*t**3)
@@ -296,7 +307,7 @@ def get_schrodinger_1e_fn(box3, beta0, w_model, w_variables, dplr_q_atoms, dplr_
         E, rho, _, k = ground_state(V, init_psi)
         # jax.debug.print("Iter k={k}", k=k)
         E0 = (jax.lax.stop_gradient(rho) * V).sum() * (jnp.diag(box) / jnp.array(M)).prod()
-        E1 = jax.lax.stop_gradient(E - E0)
+        E1 = jax.lax.stop_gradient(E - E0) # for the correct Hellmann-Feynman force
         return E0 + E1, wc, rho
     def berry_center(rho, box, return_sigma=False):
         s = (jnp.exp(1j * 2*jnp.pi* (real_grid / box[:,None,None,None])) * rho).sum(axis=(1,2,3)) / rho.sum()

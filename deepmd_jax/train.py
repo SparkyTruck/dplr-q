@@ -280,7 +280,8 @@ def train(
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn(gamma_iter=gamma_iter, n_iter=n_iter)
-    loss_fn_val, _ = model.get_loss_fn(gamma_iter=gamma_iter, n_iter=8, val=True)
+    # loss_fn_val, _ = model.get_loss_fn(gamma_iter=gamma_iter, n_iter=8, val=True)
+    loss_fn_val, _ = model.get_loss_fn(gamma_iter=gamma_iter, n_iter=n_iter+3, val=True)
     if 'atomic' not in model_type:
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     elif model_type == 'atomic':
@@ -410,11 +411,11 @@ def train(
             tic = time.time()
 
     # compress, save, and finish
-    if compress:
+    if compress and not model_type == 'atomic_iter':
         model, variables = compress_model(model,
-                                                variables,
-                                                compress_Ngrids,
-                                                compress_r_min)
+                                        variables,
+                                        compress_Ngrids,
+                                        compress_r_min)
     save_model(save_path, model, variables)
     print(f'# Training finished in {datetime.timedelta(seconds=int(time.time() - TIC))}.')
 
